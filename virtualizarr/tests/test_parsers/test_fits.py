@@ -182,33 +182,73 @@ def test_blank_is_scaled_alongside_the_data(tmp_path):
         assert np.isnan(ds["SCI"].values[0, 1])
 
 
-def test_binary_table_raises(tmp_path):
-    """Zarr v3 cannot record that a table's columns are stored big-endian."""
+def _bintable(path, columns, name="SPEC"):
     from astropy.io import fits
 
-    path = tmp_path / "bintable.fits"
     fits.HDUList(
         [
             fits.PrimaryHDU(),
-            fits.BinTableHDU.from_columns(
-                fits.ColDefs(
-                    [
-                        fits.Column(
-                            name="flux",
-                            format="E",
-                            array=np.array([1.5, 2.5], dtype=">f4"),
-                        )
-                    ]
-                ),
-                name="SPEC",
-            ),
+            fits.BinTableHDU.from_columns(fits.ColDefs(columns), name=name),
         ]
     ).writeto(path)
+    return path.as_uri()
 
-    url = path.as_uri()
+
+def test_binary_table_scalar_columns_round_trip(tmp_path):
+    """The v3 struct carries no byte order; the bytes codec is what restores it."""
+    from astropy.io import fits
+
+    url = _bintable(
+        tmp_path / "bintable.fits",
+        [
+            fits.Column(
+                name="flux", format="E", array=np.array([1.5, 2.5], dtype=">f4")
+            ),
+            fits.Column(name="n", format="J", array=np.array([7, 8], dtype=">i4")),
+        ],
+    )
+    manifest_store = FITSParser()(url, _registry(url))
+    with xr.open_zarr(manifest_store, zarr_format=3, consolidated=False) as ds:
+        table = ds["SPEC"].values
+        np.testing.assert_array_equal(table["flux"], [1.5, 2.5])
+        np.testing.assert_array_equal(table["n"], [7, 8])
+
+
+def test_binary_table_fixed_length_array_columns_are_raw_bytes(tmp_path):
+    """A subarray field is inexpressible in v3, so it keeps its bytes but loses its type."""
+    from astropy.io import fits
+
+    values = np.array([[1.5, 2.5, 3.5], [4.5, 5.5, 6.5]], dtype=">f4")
+    url = _bintable(
+        tmp_path / "vector.fits",
+        [fits.Column(name="spectrum", format="3E", array=values)],
+    )
+    manifest_store = FITSParser()(url, _registry(url))
+    with xr.open_zarr(manifest_store, zarr_format=3, consolidated=False) as ds:
+        column = ds["SPEC"].values["spectrum"]
+        assert column.dtype == np.dtype("V12")
+        # The stored bytes survive intact, in the file's own byte order.
+        recovered = np.ascontiguousarray(column).view(">f4").reshape(values.shape)
+        np.testing.assert_array_equal(recovered, values)
+
+
+def test_binary_table_variable_length_columns_raise(tmp_path):
+    """Their values live in the heap, which no single chunk of the table reaches."""
+    from astropy.io import fits
+
+    url = _bintable(
+        tmp_path / "vla.fits",
+        [
+            fits.Column(
+                name="var",
+                format="PJ()",
+                array=np.array([[1, 2], [3, 4, 5]], dtype=object),
+            )
+        ],
+    )
     registry = _registry(url)
 
-    with pytest.raises(ValueError, match="byte-swapped"):
+    with pytest.raises(ValueError, match="variable-length columns"):
         FITSParser()(url, registry)
 
     parser = FITSParser(skip_variables=["SPEC"])

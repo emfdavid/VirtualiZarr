@@ -11,11 +11,14 @@ See the FITS Standard, version 4.0.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
+import zarr
 from obspec_utils.registry import ObjectStoreRegistry
+from packaging.version import Version
 
 from virtualizarr.codecs import FITS_ASCII_CODEC_NAME
 from virtualizarr.manifests import (
@@ -41,6 +44,14 @@ _BITPIX2DTYPE: dict[int, str] = {
 # The header keyword holding a card's free text, which has no single value to
 # record as an attribute.
 _COMMENTARY_KEYWORDS = ("COMMENT", "HISTORY", "")
+
+# The bytes codec only applies its `endian` to the fields of a structured dtype from
+# this release on (zarr-python#4142). Below it, a binary table's big-endian columns
+# decode as though they were little-endian, and say nothing about it.
+_STRUCT_ENDIAN_FIX = Version("3.3.0")
+
+# TFORM for a variable-length column: an optional repeat count, then P or Q.
+_VARIABLE_LENGTH_FORMAT = re.compile(r"\d*[PQ]")
 
 
 def _attributes(header: Any) -> dict[str, Any]:
@@ -168,6 +179,66 @@ def _ascii_table_array(hdu: Any, name: str, url: str) -> ManifestArray:
     return _single_chunk_array(metadata, hdu, url, nbytes)
 
 
+def _bintable_array(hdu: Any, name: str, url: str) -> ManifestArray:
+    """Build a ManifestArray for a binary table HDU.
+
+    A binary table's row is a C struct, which maps onto the Zarr v3 ``struct`` data
+    type. That data type records no byte order -- the fields reparse native -- but
+    byte order is the bytes codec's to carry, and ``convert_to_codec_pipeline`` reads
+    it off the dtype and writes ``endian: big``, as FITS always stores a table.
+
+    Columns holding a fixed-length array survive as raw bytes rather than as numbers:
+    the v3 struct cannot express a subarray field, so ``('>f4', (5,))`` becomes an
+    opaque ``raw_bytes`` field of the same width. The bytes are the stored ones, in
+    the file's own byte order, so a reader recovers them with
+    ``np.ascontiguousarray(table["SPECTROFLUX"]).view(">f4")``.
+    """
+    if Version(zarr.__version__) < _STRUCT_ENDIAN_FIX:
+        raise ValueError(
+            f"Binary table {name!r} needs zarr >= {_STRUCT_ENDIAN_FIX} to read "
+            f"correctly (this is zarr {zarr.__version__}). The Zarr v3 'struct' data "
+            "type records no byte order, so a FITS table's big-endian columns rely on "
+            "the bytes codec, which only byte-swaps a structured dtype's fields from "
+            "that release (zarr-python#4142); older zarr returns byte-swapped numbers "
+            f"without complaint. Upgrade zarr, or pass skip_variables=['{name}']."
+        )
+
+    # A variable-length column stores a (count, offset) descriptor pointing into the
+    # heap that follows the table. The heap is outside the byte range this HDU's one
+    # chunk covers, so those columns cannot be served at all -- and unlike a
+    # fixed-length array column, their bytes would read back as plausible small
+    # integers rather than as the values they point at.
+    variable = [
+        column.name
+        for column in hdu.columns
+        if _VARIABLE_LENGTH_FORMAT.match(str(column.format))
+    ]
+    if variable:
+        raise ValueError(
+            f"Binary table {name!r} has variable-length columns {variable}, whose "
+            "values live in the heap after the table rather than in the table itself. "
+            "A chunk manifest addresses one contiguous range, which cannot reach the "
+            f"heap, so those columns would read back as descriptors. Pass "
+            f"skip_variables=['{name}'] to exclude it."
+        )
+
+    stored_dtype = hdu.columns.dtype.newbyteorder(">")
+    nrows = int(hdu.header["NAXIS2"])
+    row_nbytes = int(hdu.header["NAXIS1"])
+
+    metadata = create_v3_array_metadata(
+        shape=(nrows,),
+        data_type=stored_dtype,
+        chunk_shape=(nrows,),
+        # `Struct.default_scalar()` casts the integer 0 into every field, which a
+        # `raw_bytes` field rejects, so the zeroed row is spelled out here instead.
+        fill_value=np.zeros(1, stored_dtype)[0],
+        attributes=_attributes(hdu.header),
+        dimension_names=_dimension_names(name, 1),
+    )
+    return _single_chunk_array(metadata, hdu, url, row_nbytes * nrows)
+
+
 def _single_chunk_array(
     metadata: Any, hdu: Any, url: str, nbytes: int
 ) -> ManifestArray:
@@ -196,17 +267,7 @@ def _build_manifest_array(hdu: Any, name: str, url: str) -> ManifestArray:
     if isinstance(hdu, fits.hdu.table.TableHDU):
         return _ascii_table_array(hdu, name, url)
     if isinstance(hdu, fits.hdu.table.BinTableHDU):
-        # A binary table's columns form a structured dtype, which FITS always stores
-        # big-endian. The Zarr v3 "struct" data type cannot record the byte order of
-        # its fields, so the byte order is lost the moment the metadata is serialized
-        # and every value would read back byte-swapped. Refuse rather than hand back
-        # silently wrong numbers.
-        raise ValueError(
-            f"Binary table {name!r} cannot be virtualized, because the Zarr v3 "
-            "'struct' data type cannot record that its columns are stored "
-            "big-endian, so the values would read back byte-swapped. Pass "
-            f"skip_variables=['{name}'] to exclude it."
-        )
+        return _bintable_array(hdu, name, url)
     raise ValueError(
         f"HDU {name!r} has unsupported type {type(hdu).__name__}. Pass "
         f"skip_variables=['{name}'] to exclude it."
@@ -233,9 +294,11 @@ class FITSParser:
     """Create a [ManifestStore][virtualizarr.manifests.ManifestStore] from a FITS file.
 
     Every HDU holding data becomes an array: images and cubes of any rank, and
-    ASCII tables. Binary tables cannot yet be represented in Zarr and raise unless
-    skipped, because the Zarr v3 ``struct`` data type cannot record that a FITS
-    table's columns are stored big-endian.
+    ASCII tables, and binary tables. A binary table needs zarr >= 3.3.0, where the
+    bytes codec byte-swaps a structured dtype's fields; its fixed-length array
+    columns arrive as raw bytes, because the Zarr v3 ``struct`` data type cannot
+    express a subarray field. A table with variable-length columns raises unless
+    skipped: their values live in the heap, outside the range a chunk addresses.
 
     Parameters
     ----------
